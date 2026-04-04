@@ -2328,6 +2328,127 @@ function formatSubscriptionListLine(
 	return `${subDisplayName(entry)} -- ${formatSubscriptionMeta(entry, config, authStorage)}`;
 }
 
+function normalizeSwitchAllowedProviderNames(cwd: string): string[] | undefined {
+	const project = loadProjectConfig(cwd);
+	if (!project?.allowedSubs || project.allowedSubs.length === 0) return undefined;
+	const normalized = [...new Set(project.allowedSubs.map((value) => value.trim()).filter(Boolean))];
+	return normalized.length > 0 ? normalized : undefined;
+}
+
+function getSwitchableProviderOptions(
+	ctx: ExtensionContext | ExtensionCommandContext,
+): Array<{ providerName: string; label: string; description: string }> {
+	const config = loadGlobalConfig();
+	const envEntries = parseEnvConfig();
+	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
+	const allowedProviderNames = normalizeSwitchAllowedProviderNames(ctx.cwd);
+	const allowed = allowedProviderNames ? new Set(allowedProviderNames) : undefined;
+	const options: Array<{ providerName: string; label: string; description: string }> = [];
+	const seen = new Set<string>();
+	const push = (providerName: string, label: string, description: string) => {
+		if (allowed && !allowed.has(providerName)) return;
+		if (!ctx.modelRegistry.authStorage.hasAuth(providerName)) return;
+		if (seen.has(providerName)) return;
+		seen.add(providerName);
+		options.push({ providerName, label, description });
+	};
+
+	for (const providerName of SUPPORTED_PROVIDERS) {
+		push(
+			providerName,
+			PROVIDER_TEMPLATES[providerName]?.displayName || providerName,
+			"base provider",
+		);
+	}
+	for (const entry of allSubs) {
+		push(subProviderName(entry), subDisplayName(entry), "extra subscription");
+	}
+	return options;
+}
+
+function resolveSwitchTargetModel(
+	ctx: ExtensionContext | ExtensionCommandContext,
+	providerName: string,
+	preferredModelId?: string,
+): Model<Api> | undefined {
+	if (!ctx.modelRegistry.authStorage.hasAuth(providerName)) {
+		return undefined;
+	}
+	if (preferredModelId) {
+		const preferred = ctx.modelRegistry.find(providerName, preferredModelId);
+		if (preferred) {
+			return preferred as Model<Api>;
+		}
+	}
+	const baseProvider = getBaseProvider(providerName);
+	if (!baseProvider) {
+		return undefined;
+	}
+	for (const baseModel of getModels(baseProvider as any) as Model<Api>[]) {
+		const candidate = ctx.modelRegistry.find(providerName, baseModel.id);
+		if (candidate) {
+			return candidate as Model<Api>;
+		}
+	}
+	return undefined;
+}
+
+async function handleSubsSwitch(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	requestedProviderName?: string,
+): Promise<void> {
+	const options = getSwitchableProviderOptions(ctx);
+	if (options.length === 0) {
+		const allowedProviderNames = normalizeSwitchAllowedProviderNames(ctx.cwd);
+		const suffix = allowedProviderNames && allowedProviderNames.length > 0
+			? ` for this project restriction (${allowedProviderNames.join(", ")})`
+			: "";
+		ctx.ui.notify(`No authenticated subscriptions are available to switch${suffix}.`, "info");
+		return;
+	}
+
+	let providerName = requestedProviderName?.trim();
+	if (!providerName) {
+		providerName = await showWrappedSelect(ctx, {
+			title: "Switch Subscription",
+			subtitle: "Select the subscription/provider to use now.",
+			items: options.map((option) => ({
+				value: option.providerName,
+				label: option.label,
+				description: option.description,
+			})),
+			initialValue: ctx.model?.provider,
+			confirmHint: "switch",
+			cancelHint: "back",
+		});
+		if (!providerName) return;
+	}
+
+	const selected = options.find((option) => option.providerName === providerName);
+	if (!selected) {
+		ctx.ui.notify(`Subscription not available for switching: ${providerName}`, "error");
+		return;
+	}
+
+	const nextModel = resolveSwitchTargetModel(ctx, selected.providerName, ctx.model?.id);
+	if (!nextModel) {
+		ctx.ui.notify(`No selectable models found for ${selected.label}.`, "error");
+		return;
+	}
+	if (ctx.model?.provider === nextModel.provider && ctx.model?.id === nextModel.id) {
+		ctx.ui.notify(`Already using ${selected.label} (${nextModel.id}).`, "info");
+		return;
+	}
+
+	const success = await pi.setModel(nextModel);
+	if (!success) {
+		ctx.ui.notify(`Failed to switch to ${selected.label}.`, "error");
+		return;
+	}
+	ctx.ui.notify(`Switched to ${selected.label} (${nextModel.id}).`, "info");
+}
+
 async function renameSubscriptionLabel(
 	ctx: ExtensionCommandContext,
 	config: MultiPassConfig,
@@ -4205,6 +4326,7 @@ async function handleSubsMenu(
 		{ value: "remove", label: "remove", description: "Remove a subscription" },
 		{ value: "login", label: "login", description: "Login to a subscription" },
 		{ value: "logout", label: "logout", description: "Logout from a subscription" },
+		{ value: "switch", label: "switch", description: "Switch to a different subscription/provider now" },
 		{ value: "status", label: "status", description: "Show auth status and token info" },
 		{ value: "limits", label: "limits", description: "Check built-in quota support (Codex + Google)" },
 	];
@@ -4237,6 +4359,9 @@ async function handleSubsMenu(
 				break;
 			case "logout":
 				await handleSubsLogout(ctx);
+				break;
+			case "switch":
+				await handleSubsSwitch(pi, ctx);
 				break;
 			case "status":
 				await handleSubsStatus(ctx);
@@ -4406,7 +4531,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("subs", {
 		description: "Manage extra OAuth subscriptions",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["list", "add", "remove", "login", "logout", "status", "limits"];
+			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "status", "limits"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
@@ -4414,7 +4539,9 @@ export default function multiSub(pi: ExtensionAPI) {
 		},
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			const config = loadGlobalConfig();
-			const subcommand = args.trim().toLowerCase();
+			const parts = args.trim().split(/\s+/).filter(Boolean);
+			const subcommand = (parts[0] || "").toLowerCase();
+			const rest = parts.slice(1).join(" ");
 			switch (subcommand) {
 				case "list":
 				case "ls":
@@ -4430,6 +4557,8 @@ export default function multiSub(pi: ExtensionAPI) {
 					return handleSubsLogin(ctx);
 				case "logout":
 					return handleSubsLogout(ctx);
+				case "switch":
+					return handleSubsSwitch(pi, ctx, rest || undefined);
 				case "status":
 				case "info":
 					return handleSubsStatus(ctx);
