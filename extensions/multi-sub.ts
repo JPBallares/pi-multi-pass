@@ -34,6 +34,7 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
+import { pathToFileURL } from "url";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -46,27 +47,9 @@ import {
 	getAgentDir,
 	keyHint,
 } from "@earendil-works/pi-coding-agent";
-import {
-	anthropicOAuthProvider,
-	loginAnthropic,
-	refreshAnthropicToken,
-	openaiCodexOAuthProvider,
-	loginOpenAICodex,
-	refreshOpenAICodexToken,
-	githubCopilotOAuthProvider,
-	loginGitHubCopilot,
-	refreshGitHubCopilotToken,
-	getGitHubCopilotBaseUrl,
-	normalizeDomain,
-	geminiCliOAuthProvider,
-	loginGeminiCli,
-	refreshGoogleCloudToken,
-	antigravityOAuthProvider,
-	loginAntigravity,
-	refreshAntigravityToken,
-	type OAuthCredentials,
-	type OAuthLoginCallbacks,
-	type OAuthProviderInterface,
+import type {
+	OAuthCredentials,
+	OAuthLoginCallbacks,
 } from "@earendil-works/pi-ai/oauth";
 import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
 import {
@@ -84,89 +67,245 @@ import {
 
 type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
 type GeminiCredentials = OAuthCredentials & { projectId?: string };
+type ModifyModelsFn = (models: Model<Api>[], credentials: OAuthCredentials) => Model<Api>[];
+
+type RuntimeOAuthProvider = {
+	name: string;
+	login(interaction: {
+		notify(event: unknown): void;
+		prompt(prompt: unknown): Promise<string | undefined>;
+		signal?: AbortSignal;
+	}): Promise<OAuthCredentials>;
+	refresh(credentials: OAuthCredentials): Promise<OAuthCredentials>;
+};
+
+interface LegacyOAuthProviderConfig {
+	name: string;
+	usesCallbackServer?: boolean;
+	login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
+	refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials>;
+	getApiKey(credentials: OAuthCredentials): string;
+	modifyModels?: ModifyModelsFn;
+}
 
 interface ProviderTemplate {
 	displayName: string;
-	builtinOAuth: OAuthProviderInterface;
 	usesCallbackServer?: boolean;
-	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
-	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
+	buildOAuth(index: number): Omit<LegacyOAuthProviderConfig, "modifyModels">;
+	buildModifyModels?(providerName: string): ModifyModelsFn;
+}
+
+const GLOBAL_NODE_MODULES = join(dirname(dirname(process.execPath)), "lib", "node_modules");
+const PI_AI_OAUTH_LOAD_CANDIDATES = [
+	join(
+		GLOBAL_NODE_MODULES,
+		"@earendil-works",
+		"pi-coding-agent",
+		"node_modules",
+		"@earendil-works",
+		"pi-ai",
+		"dist",
+		"auth",
+		"oauth",
+		"load.js",
+	),
+	join(
+		getAgentDir(),
+		"npm",
+		"node_modules",
+		"pi-mcp-adapter",
+		"node_modules",
+		"@earendil-works",
+		"pi-ai",
+		"dist",
+		"auth",
+		"oauth",
+		"load.js",
+	),
+];
+const PI_AI_OAUTH_LOAD_PATH = PI_AI_OAUTH_LOAD_CANDIDATES.find((candidate) => existsSync(candidate));
+if (!PI_AI_OAUTH_LOAD_PATH) {
+	throw new Error("pi-multi-pass: could not locate current pi-ai OAuth runtime");
+}
+const PI_AI_OAUTH_LOAD_URL = pathToFileURL(PI_AI_OAUTH_LOAD_PATH).href;
+
+const runtimeOAuthProviderCache = new Map<string, Promise<RuntimeOAuthProvider>>();
+const AUTH_JSON_PATH = join(getAgentDir(), "auth.json");
+
+function readStoredCredentialCompat(provider: string): AuthStorageEntry | undefined {
+	try {
+		const parsed = JSON.parse(readFileSync(AUTH_JSON_PATH, "utf-8")) as Record<string, AuthStorageEntry>;
+		return parsed[provider];
+	} catch {
+		return undefined;
+	}
+}
+
+function ensureAuthStorageCompat(modelRegistry: any): {
+	hasAuth(provider: string): boolean;
+	get(provider: string): AuthStorageEntry | undefined;
+	logout(provider: string): Promise<void>;
+} {
+	if (modelRegistry.authStorage) return modelRegistry.authStorage;
+	const compat = {
+		hasAuth(provider: string): boolean {
+			return !!modelRegistry.getProviderAuthStatus?.(provider)?.configured;
+		},
+		get(provider: string): AuthStorageEntry | undefined {
+			return readStoredCredentialCompat(provider);
+		},
+		async logout(provider: string): Promise<void> {
+			await modelRegistry.runtime?.logout?.(provider);
+		},
+	};
+	modelRegistry.authStorage = compat;
+	return compat;
+}
+
+function normalizeDomain(input: string): string | null {
+	const trimmed = input.trim();
+	if (!trimmed) return null;
+	try {
+		const url = trimmed.includes("://") ? new URL(trimmed) : new URL(`https://${trimmed}`);
+		return url.hostname;
+	} catch {
+		return null;
+	}
+}
+
+function getGitHubCopilotBaseUrl(token?: string, enterpriseDomain?: string): string {
+	if (token) {
+		const match = token.match(/proxy-ep=([^;]+)/);
+		if (match?.[1]) {
+			return `https://${match[1].replace(/^proxy\./, "api.")}`;
+		}
+	}
+	if (enterpriseDomain) return `https://copilot-api.${enterpriseDomain}`;
+	return "https://api.individual.githubcopilot.com";
+}
+
+async function loadRuntimeOAuthProvider(provider: "anthropic" | "openai-codex" | "github-copilot"): Promise<RuntimeOAuthProvider> {
+	let cached = runtimeOAuthProviderCache.get(provider);
+	if (!cached) {
+		cached = (async () => {
+			const loaders = await import(PI_AI_OAUTH_LOAD_URL);
+			switch (provider) {
+				case "anthropic":
+					return loaders.loadAnthropicOAuth();
+				case "openai-codex":
+					return loaders.loadOpenAICodexOAuth();
+				case "github-copilot":
+					return loaders.loadGitHubCopilotOAuth();
+			}
+		})();
+		runtimeOAuthProviderCache.set(provider, cached);
+	}
+	return cached;
+}
+
+function createLegacyInteraction(callbacks: OAuthLoginCallbacks) {
+	return {
+		signal: callbacks.signal,
+		notify(event: any): void {
+			if (!event || typeof event !== "object") return;
+			if (event.type === "auth_url") {
+				callbacks.onAuth({ url: event.url, instructions: event.instructions });
+				return;
+			}
+			if (event.type === "device_code") {
+				callbacks.onDeviceCode({
+					userCode: event.userCode,
+					verificationUri: event.verificationUri,
+					intervalSeconds: event.intervalSeconds,
+					expiresInSeconds: event.expiresInSeconds,
+				});
+				return;
+			}
+			if (event.type === "progress" && typeof event.message === "string") {
+				callbacks.onProgress?.(event.message);
+			}
+		},
+		async prompt(prompt: any): Promise<string | undefined> {
+			if (!prompt || typeof prompt !== "object") return undefined;
+			if (prompt.type === "select") {
+				return callbacks.onSelect({
+					message: prompt.message,
+					options: Array.isArray(prompt.options)
+						? prompt.options.map((option: any) => ({ id: option.id, label: option.label }))
+						: [],
+				});
+			}
+			if (prompt.type === "manual_code") {
+				if (callbacks.onManualCodeInput) return callbacks.onManualCodeInput();
+				return callbacks.onPrompt({
+					message: prompt.message ?? "Paste the authorization code",
+					placeholder: prompt.placeholder,
+				});
+			}
+			return callbacks.onPrompt({
+				message: prompt.message ?? "",
+				placeholder: prompt.placeholder,
+				allowEmpty: prompt.allowEmpty,
+			});
+		},
+	};
+}
+
+function buildRuntimeOAuth(provider: "anthropic" | "openai-codex" | "github-copilot", name: string, usesCallbackServer = false): Omit<LegacyOAuthProviderConfig, "modifyModels"> {
+	return {
+		name,
+		usesCallbackServer,
+		async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+			return (await loadRuntimeOAuthProvider(provider)).login(createLegacyInteraction(callbacks));
+		},
+		async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+			return (await loadRuntimeOAuthProvider(provider)).refresh(credentials);
+		},
+		getApiKey(credentials: OAuthCredentials): string {
+			return credentials.access;
+		},
+	};
+}
+
+function buildUnsupportedOAuth(name: string, provider: string, usesCallbackServer = false): Omit<LegacyOAuthProviderConfig, "modifyModels"> {
+	return {
+		name,
+		usesCallbackServer,
+		async login(): Promise<OAuthCredentials> {
+			throw new Error(`${provider} not supported by installed pi version`);
+		},
+		async refreshToken(): Promise<OAuthCredentials> {
+			throw new Error(`${provider} not supported by installed pi version`);
+		},
+		getApiKey(credentials: OAuthCredentials): string {
+			const creds = credentials as GeminiCredentials;
+			return creds.projectId
+				? JSON.stringify({ token: creds.access, projectId: creds.projectId })
+				: credentials.access;
+		},
+	};
 }
 
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 	anthropic: {
 		displayName: "Anthropic (Claude Pro/Max)",
-		builtinOAuth: anthropicOAuthProvider,
 		buildOAuth(index: number) {
-			return {
-				name: `Anthropic #${index}`,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAnthropic({
-						onAuth: callbacks.onAuth,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						onManualCodeInput: callbacks.onManualCodeInput,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return refreshAnthropicToken(credentials.refresh);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
+			return buildRuntimeOAuth("anthropic", `Anthropic #${index}`);
 		},
 	},
 
 	"openai-codex": {
 		displayName: "ChatGPT Plus/Pro (Codex)",
-		builtinOAuth: openaiCodexOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return {
-				name: `ChatGPT Codex #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginOpenAICodex({
-						onAuth: callbacks.onAuth,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						onManualCodeInput: callbacks.onManualCodeInput,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return refreshOpenAICodexToken(credentials.refresh);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
+			return buildRuntimeOAuth("openai-codex", `ChatGPT Codex #${index}`, true);
 		},
 	},
 
 	"github-copilot": {
 		displayName: "GitHub Copilot",
-		builtinOAuth: githubCopilotOAuthProvider,
 		buildOAuth(index: number) {
-			return {
-				name: `GitHub Copilot #${index}`,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginGitHubCopilot({
-						onAuth: (url: string, instructions?: string) =>
-							callbacks.onAuth({ url, instructions }),
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						signal: callbacks.signal,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as CopilotCredentials;
-					return refreshGitHubCopilotToken(creds.refresh, creds.enterpriseUrl);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
+			return buildRuntimeOAuth("github-copilot", `GitHub Copilot #${index}`);
 		},
 		buildModifyModels(providerName: string) {
 			return (models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[] => {
@@ -184,57 +323,17 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 
 	"google-gemini-cli": {
 		displayName: "Google Cloud Code Assist",
-		builtinOAuth: geminiCliOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return {
-				name: `Google Cloud Code Assist #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginGeminiCli(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as GeminiCredentials;
-					if (!creds.projectId) throw new Error("Missing projectId");
-					return refreshGoogleCloudToken(creds.refresh, creds.projectId);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					const creds = credentials as GeminiCredentials;
-					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
-				},
-			};
+			return buildUnsupportedOAuth(`Google Cloud Code Assist #${index}`, "google-gemini-cli", true);
 		},
 	},
 
 	"google-antigravity": {
 		displayName: "Antigravity",
-		builtinOAuth: antigravityOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return {
-				name: `Antigravity #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAntigravity(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as GeminiCredentials;
-					if (!creds.projectId) throw new Error("Missing projectId");
-					return refreshAntigravityToken(creds.refresh, creds.projectId);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					const creds = credentials as GeminiCredentials;
-					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
-				},
-			};
+			return buildUnsupportedOAuth(`Antigravity #${index}`, "google-antigravity", true);
 		},
 	},
 };
@@ -1899,10 +1998,19 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	const template = PROVIDER_TEMPLATES[entry.provider];
 	if (!template) return;
 
+	let builtinModels: Model<Api>[];
+	try {
+		builtinModels = getModels(entry.provider as any) as Model<Api>[];
+	} catch (error) {
+		console.warn(
+			`[pi-multi-pass] skipping unsupported provider ${entry.provider}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return;
+	}
+
 	const name = subProviderName(entry);
 	const oauth = template.buildOAuth(entry.index);
 	const modifyModels = template.buildModifyModels?.(name);
-	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
 	const baseUrl = builtinModels[0]?.baseUrl || "";
 	const models = cloneModels(entry.provider, entry.index);
 
@@ -5440,6 +5548,7 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// On session start, reload pools with project-level config
 	pi.on("session_start", async (_event, ctx) => {
+		ensureAuthStorageCompat(ctx.modelRegistry);
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 
@@ -5469,10 +5578,12 @@ export default function multiSub(pi: ExtensionAPI) {
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
+		ensureAuthStorageCompat(ctx.modelRegistry);
 		await enforceProjectRestriction(ctx, "model");
 	});
 
 	pi.on("input", async (event, ctx) => {
+		ensureAuthStorageCompat(ctx.modelRegistry);
 		if (event.text.trimStart().startsWith("/")) {
 			return { action: "continue" as const };
 		}
@@ -5485,12 +5596,14 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// Listen for user input to track last prompt
 	pi.on("before_agent_start", async (event, ctx) => {
+		ensureAuthStorageCompat(ctx.modelRegistry);
 		lastUserPrompt = event.prompt;
 		poolManager.startTurn(event.prompt, ctx.model);
 	});
 
 	// Listen for errors to trigger pool rotation
 	pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
+		ensureAuthStorageCompat(ctx.modelRegistry);
 		if (!event.messages || event.messages.length === 0) return;
 
 		const lastMsg = event.messages[event.messages.length - 1];
@@ -5544,6 +5657,7 @@ export default function multiSub(pi: ExtensionAPI) {
 				: null;
 		},
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			ensureAuthStorageCompat(ctx.modelRegistry);
 			const config = loadGlobalConfig();
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			const subcommand = (parts[0] || "").toLowerCase();
@@ -5589,6 +5703,7 @@ export default function multiSub(pi: ExtensionAPI) {
 				: null;
 		},
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			ensureAuthStorageCompat(ctx.modelRegistry);
 			const parts = args
 				.trim()
 				.toLowerCase()
@@ -5659,6 +5774,7 @@ export default function multiSub(pi: ExtensionAPI) {
 			return presetNames.length > 0 ? presetNames : null;
 		},
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			ensureAuthStorageCompat(ctx.modelRegistry);
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			const subcommand = (parts[0] || "").toLowerCase();
 			const rest = parts.slice(1).join(" ");
